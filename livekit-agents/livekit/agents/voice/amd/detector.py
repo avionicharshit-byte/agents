@@ -126,7 +126,7 @@ class AMD(EventEmitter[Literal["amd_prediction"]]):
             if LiveKit inference credentials are available in the environment
             it uses ``"google/gemini-3.1-flash-lite"`` via the
             inference gateway; otherwise it falls back to the session's own
-            LLM.
+            LLM. Pass ``None`` to always reuse the session's LLM.
         interrupt_on_machine: If ``True`` (default), interrupt any pending
             agent speech immediately when a machine is detected.
         ivr_detection: If ``True`` (default), automatically start IVR
@@ -140,7 +140,8 @@ class AMD(EventEmitter[Literal["amd_prediction"]]):
             ``"cartesia/ink-whisper"``). When omitted, AMD auto-selects:
             if LiveKit inference credentials are available it uses
             ``"cartesia/ink-whisper"`` via the inference gateway; otherwise
-            it reuses the session's existing STT transcripts.
+            it reuses the session's existing STT transcripts. Pass ``None`` to
+            always reuse the session's STT transcripts.
         suppress_compatibility_warning: If ``True``, do not log a warning when
             the resolved STT or LLM is not among the bundled AMD-tested model
             strings. Has no effect on classification behavior.
@@ -169,8 +170,8 @@ class AMD(EventEmitter[Literal["amd_prediction"]]):
         self,
         session: AgentSession,
         *,
-        llm: NotGivenOr[LLM | LLMModels | str] = NOT_GIVEN,
-        stt: NotGivenOr[STT | str] = NOT_GIVEN,
+        llm: NotGivenOr[LLM | LLMModels | str | None] = NOT_GIVEN,
+        stt: NotGivenOr[STT | str | None] = NOT_GIVEN,
         interrupt_on_machine: bool = True,
         ivr_detection: bool = True,
         participant_identity: NotGivenOr[str] = NOT_GIVEN,
@@ -193,14 +194,20 @@ class AMD(EventEmitter[Literal["amd_prediction"]]):
             if not is_given(stt):
                 stt = self._DEFAULT_STT_MODEL if auto_select else NOT_GIVEN
 
-        self._llm_config: NotGivenOr[LLM | LLMModels | str] = llm
+        self._llm_config: NotGivenOr[LLM | LLMModels | str | None] = llm
         self._session: AgentSession = session
         self._interrupt_on_machine = interrupt_on_machine
         self._ivr_detection = ivr_detection
         self._wait_until_finished = wait_until_finished
         self._suppress_compatibility_warning = suppress_compatibility_warning
         self._participant_identity: NotGivenOr[str] = participant_identity
-        self._stt: NotGivenOr[_STT] = _InferenceSTT(stt) if isinstance(stt, str) else stt
+        self._stt: NotGivenOr[_STT]
+        if stt is None:
+            self._stt = NOT_GIVEN
+        elif isinstance(stt, str):
+            self._stt = _InferenceSTT(stt)
+        else:
+            self._stt = stt
 
         self._classifier: _AMDClassifier | None = None
         self._result: AMDPredictionEvent | None = None

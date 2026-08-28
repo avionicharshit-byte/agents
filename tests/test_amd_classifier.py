@@ -83,6 +83,22 @@ def _machine_vm_response(transcript: str = "voicemail greeting") -> FakeLLMRespo
     )
 
 
+def _human_response(transcript: str = "hello") -> FakeLLMResponse:
+    return FakeLLMResponse(
+        input=transcript,
+        content="",
+        ttft=0.0,
+        duration=0.05,
+        tool_calls=[
+            FunctionToolCall(
+                name="save_prediction",
+                arguments='{"label": "human"}',
+                call_id="c1",
+            )
+        ],
+    )
+
+
 class TestAMDClassifier:
     """Tests for ``_AMDClassifier`` silence-timer behaviour."""
 
@@ -602,6 +618,46 @@ class TestAMDClassifier:
 
         await clf.close()
 
+    async def test_detection_timeout_preserves_transcript(self) -> None:
+        llm = FakeLLM(
+            fake_responses=[
+                FakeLLMResponse(
+                    input="hello",
+                    content="",
+                    ttft=0.0,
+                    duration=0.05,
+                    tool_calls=[
+                        FunctionToolCall(
+                            name="save_prediction",
+                            arguments='{"label": "uncertain"}',
+                            call_id="c1",
+                        )
+                    ],
+                )
+            ]
+        )
+        clf = _make_classifier(
+            llm=llm,
+            timeout=0.4,
+            wait_until_finished=True,
+            max_endpointing_delay=0.2,
+        )
+        clf.start_listening()
+        clf.start_detection_timer()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.push_text("hello")
+
+        await asyncio.wait_for(clf._verdict_ready.wait(), timeout=1.0)
+
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.UNCERTAIN
+        assert results[0].reason == "detection_timeout"
+        assert results[0].transcript == "hello"
+
+        await clf.close()
+
     async def test_speech_restart_cancels_eot_backstop(self) -> None:
         """on_user_speech_started cancels the EOT timer and resets the gate."""
         clf = _make_classifier(human_speech_threshold=0.05, max_endpointing_delay=0.3)
@@ -623,18 +679,84 @@ class TestAMDClassifier:
 
         await clf.close()
 
-    async def test_max_endpointing_delay_starts_from_transcript_without_eos(self) -> None:
-        """A final transcript alone starts AMD's synthetic EOT timer."""
-        clf = _make_classifier(max_endpointing_delay=0.3)
+    async def test_max_endpointing_delay_emits_human_without_vad_boundaries(self) -> None:
+        """A final transcript can complete AMD without VAD boundaries."""
+        clf = _make_classifier(
+            llm=FakeLLM(fake_responses=[_human_response()]),
+            timeout=5.0,
+            max_endpointing_delay=0.3,
+        )
         clf.start_listening()
+        clf.start_detection_timer()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
 
-        clf.push_text("voicemail greeting")
+        clf.push_text("hello")
         assert clf._eot_timer is not None
 
         await asyncio.sleep(0.4)
 
         assert clf._eot_reached is True
         assert clf._eot_timer is None
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.HUMAN
+        assert results[0].reason == "llm"
+
+        await clf.close()
+
+    async def test_max_endpointing_delay_emits_machine_without_vad_boundaries(self) -> None:
+        clf = _make_classifier(
+            llm=FakeLLM(fake_responses=[_machine_vm_response()]),
+            timeout=5.0,
+            max_endpointing_delay=0.3,
+        )
+        clf.start_listening()
+        clf.start_detection_timer()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.push_text("voicemail greeting")
+
+        await asyncio.sleep(0.2)
+        assert clf._verdict_result is not None
+        assert results == []
+
+        await asyncio.sleep(0.2)
+
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.MACHINE_VM
+
+        await clf.close()
+
+    async def test_transcript_eot_waits_for_latest_chunk(self) -> None:
+        llm = FakeLLM(
+            fake_responses=[
+                _human_response("hello"),
+                _machine_vm_response("hello you've reached"),
+            ]
+        )
+        clf = _make_classifier(llm=llm, timeout=5.0, max_endpointing_delay=0.3)
+        clf.start_listening()
+        clf.start_detection_timer()
+        results: list[AMDPredictionEvent] = []
+        clf.on("amd_prediction", results.append)
+
+        clf.push_text("hello")
+        await asyncio.sleep(0.2)
+        assert clf._verdict_result is not None
+        assert clf._verdict_result.category == AMDCategory.HUMAN
+        assert results == []
+
+        clf.push_text("you've reached")
+        await asyncio.sleep(0.2)
+        assert clf._verdict_result is not None
+        assert clf._verdict_result.category == AMDCategory.MACHINE_VM
+        assert results == []
+
+        await asyncio.sleep(0.2)
+
+        assert len(results) == 1
+        assert results[0].category == AMDCategory.MACHINE_VM
 
         await clf.close()
 
@@ -739,6 +861,62 @@ class TestAMDClassifier:
 
         assert clf is not None
         assert clf._wait_until_finished is False
+
+    def test_none_reuses_session_models(self) -> None:
+        llm = FakeLLM()
+        session = SimpleNamespace(llm=llm, _activity=None)
+        detector = AMD(
+            session,  # type: ignore[arg-type]
+            llm=None,
+            stt=None,
+            suppress_compatibility_warning=True,
+        )
+
+        clf = detector._resolve_classifier(session)  # type: ignore[arg-type]
+
+        assert detector._llm_config is None
+        assert detector._stt is NOT_GIVEN
+        assert clf is not None
+        assert clf._llm is llm
+        assert clf._source == "stt"
+
+    def test_not_given_auto_selects_cloud_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(amd_detector, "is_cloud", lambda _: True)
+        monkeypatch.setenv("LIVEKIT_URL", "wss://test.livekit.cloud")
+        monkeypatch.setenv("LIVEKIT_API_KEY", "key")
+        monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
+
+        session = SimpleNamespace(llm=FakeLLM(), _activity=None)
+        detector = AMD(
+            session,  # type: ignore[arg-type]
+            suppress_compatibility_warning=True,
+        )
+
+        assert detector._llm_config == detector._DEFAULT_LLM_MODEL
+        assert detector._stt is not NOT_GIVEN
+        assert detector._stt.model == detector._DEFAULT_STT_MODEL
+
+    def test_explicit_models_override_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LIVEKIT_URL", "wss://test.livekit.cloud")
+        monkeypatch.setenv("LIVEKIT_API_KEY", "key")
+        monkeypatch.setenv("LIVEKIT_API_SECRET", "secret")
+        llm = FakeLLM()
+        session = SimpleNamespace(llm=FakeLLM(), _activity=None)
+        detector = AMD(
+            session,  # type: ignore[arg-type]
+            llm=llm,
+            stt="deepgram/nova-3",
+            suppress_compatibility_warning=True,
+        )
+
+        clf = detector._resolve_classifier(session)  # type: ignore[arg-type]
+
+        assert detector._llm_config is llm
+        assert detector._stt is not NOT_GIVEN
+        assert detector._stt.model == "deepgram/nova-3"
+        assert clf is not None
+        assert clf._llm is llm
+        assert clf._source == "amd_stt"
 
     async def test_setup_arms_detection_timer_only_at_listening(
         self, monkeypatch: pytest.MonkeyPatch
